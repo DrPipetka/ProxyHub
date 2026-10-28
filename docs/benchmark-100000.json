@@ -1,0 +1,11 @@
+{
+  "count": 100000,
+  "accepted": 100000,
+  "import_seconds": 34.133,
+  "first_page_ms": 69.23,
+  "last_page_ms": 53.4,
+  "filtered_ms": 59.28,
+  "search_ms": 107.4,
+  "peak_process_rss_mb": 141.8,
+  "note": "Local storage/API benchmark; no 50-proxy live workload"
+}

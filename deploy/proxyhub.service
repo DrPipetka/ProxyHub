@@ -1,0 +1,22 @@
+[Unit]
+Description=ProxyHub local proxy pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxyhub
+Group=proxyhub
+WorkingDirectory=/opt/proxyhub
+ExecStart=/opt/proxyhub/.venv/bin/python -m proxyhub
+Environment=PROXYHUB_DATA_DIR=/var/lib/proxyhub
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
