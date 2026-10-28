@@ -25,6 +25,44 @@ async def socks_greeting(port):
     return response
 
 
+async def test_service_disable_stops_xray_and_enable_restarts(tmp_path):
+    from conftest import seed
+    from proxyhub.service import Service
+
+    service = Service(tmp_path)
+    service.settings.xray_path = str(BIN)
+    service.settings.auto_download = False
+    service.settings.measure_geo = False
+    service.settings.pool_size = 1
+    service.scheduler.direct_checked = time.time()
+    seed(service.db)
+    service.db.execute('UPDATE proxies SET next_check_at=?', (time.time() + 3600,))
+
+    async def raised():
+        while True:
+            row = service.db.one('SELECT port FROM proxies WHERE port IS NOT NULL')
+            if row:
+                return row['port']
+            await asyncio.sleep(0.05)
+
+    try:
+        await service.start()
+        first_port = await asyncio.wait_for(raised(), 15)
+        assert await socks_greeting(first_port) == b'\x05\x00'
+        process = service.core.pool
+        await service.set_enabled(False)
+        assert process.returncode is not None
+        assert not service.core.processes and not service.core.ready
+        with pytest.raises(OSError):
+            await asyncio.open_connection('127.0.0.1', first_port)
+        await service.set_enabled(True)
+        second_port = await asyncio.wait_for(raised(), 15)
+        assert service.core.pool is not process
+        assert await socks_greeting(second_port) == b'\x05\x00'
+    finally:
+        await service.close()
+
+
 async def test_real_dynamic_api_and_process_cleanup(tmp_path):
     core = XrayAdapter(Settings(xray_path=str(BIN), auto_download=False), tmp_path)
     ports = PortAllocator((21000, 21999))

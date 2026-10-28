@@ -10,20 +10,36 @@ def client_for(tmp_path):
     return TestClient(create_app(tmp_path, core=FakeCore(), background=False), base_url='http://127.0.0.1')
 
 
-def test_auth_import_and_masking(tmp_path):
+def test_auth_import_and_full_config(tmp_path):
     with client_for(tmp_path) as c:
         assert c.get('/status').status_code == 401
         assert c.post('/auth/login', json={}).status_code == 200
         r = c.post('/proxies', json={"data": f"trojan://supersecret@example.com:443", "source": "test"})
         assert r.json()["accepted"] == 1
         listing = c.get('/proxies').json()
-        assert "supersecret" not in str(listing)
+        assert listing['items'][0]['link'] == 'trojan://supersecret@example.com:443'
+        assert 'masked_link' not in listing['items'][0]
         assert "supersecret" in c.get('/proxies/1/link').json()['link']
         assert c.get('/status').json()['states']['new'] == 1
         assert c.get('/proxies?page=0').status_code == 400
         token = c.get('/settings').json()['values']['api_token']
         c.cookies.clear()
         assert c.get('/status', headers={"Authorization": "Bearer " + token}).status_code == 200
+
+
+def test_api_documentation_requires_auth_and_matches_routes(tmp_path):
+    with client_for(tmp_path) as c:
+        assert c.get('/openapi.json').status_code == 401
+        assert c.get('/subscriptions').status_code == 401
+        c.post('/auth/login', json={})
+        schema = c.get('/openapi.json').json()
+        assert schema['paths']['/proxies']['get']['security'] == [{'BearerAuth': []}]
+        assert schema['paths']['/health']['get']['security'] == []
+        assert '422' not in schema['paths']['/config']['get']['responses']
+        assert schema['paths']['/proxies']['post']['requestBody']['content']['application/json']['example']['interval_minutes'] == 60
+        assert '/subscriptions/{subscription_id}/refresh' in schema['paths']
+        assert any(p['name'] == 'lease' for p in schema['paths']['/config']['get']['parameters'])
+        assert 'text/plain' in schema['paths']['/config']['get']['responses']['200']['content']
 
 
 def test_config_leasing_used_and_count(tmp_path):

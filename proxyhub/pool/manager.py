@@ -14,6 +14,7 @@ class PoolManager:
     def __init__(self, db, settings, core):
         self.db, self.settings, self.core = db, settings, core
         self.lock = asyncio.Lock()
+        self.enabled = True
         self.ports = PortAllocator(settings.pool_port_range, settings.bind_address)
 
     def get(self, proxy_id):
@@ -83,6 +84,8 @@ class PoolManager:
 
     async def acquire(self, config=False, lease=True, filters=None, ttl=None):
         async with self.lock:
+            if not self.enabled:
+                raise ServiceError("service_disabled", 503, "Работа прокси отключена. Включите её в панели.")
             rows = self.candidates(("active", "valid") if config else ("active",), filters)
             if not rows and not config and self.settings.on_demand:
                 rows = self.candidates(("valid",), filters)
@@ -143,6 +146,8 @@ class PoolManager:
 
     async def tick(self):
         async with self.lock:
+            if not self.enabled:
+                return
             now = time.time()
             for row in self.db.rows("SELECT * FROM proxies WHERE state='leased' AND lease_expires_at<=?", (now,)):
                 await self._cooldown(row, now)

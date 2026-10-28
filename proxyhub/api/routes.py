@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..checker.pipeline import small_request
 from ..config import RESTART_FIELDS, Settings, hash_password, verify_password
-from ..core.installer import download_limited
 from ..core.xray import port_available
 from ..db import STATES
 from ..parsers import import_configs
@@ -46,6 +45,10 @@ class Action(BaseModel):
 class Bulk(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=500)
     action: Literal["disable", "enable", "used", "invalid", "recheck", "release"]
+
+
+class SubscriptionInterval(BaseModel):
+    interval_minutes: int = Field(60, ge=0, le=525600, strict=True)
 
 
 @public.post("/auth/login")
@@ -94,21 +97,25 @@ async def add_proxies(request: Request):
     if "application/json" in request.headers.get("content-type", ""):
         try:
             value = json.loads(content)
-            if isinstance(value, dict) and ("data" in value or "url" in value):
+            if isinstance(value, dict) and any(key in value for key in ("data", "url", "urls")):
                 source = value.get("source", "")
                 if not isinstance(source, str) or len(source) > 256:
                     raise ServiceError("invalid_source")
-                if "url" in value and "data" in value:
+                if sum(key in value for key in ("data", "url", "urls")) != 1:
                     raise ServiceError("data_or_url_required")
-                if "url" in value:
+                if "url" in value or "urls" in value:
+                    try:
+                        interval = SubscriptionInterval(interval_minutes=value.get("interval_minutes", 60)).interval_minutes
+                    except ValidationError:
+                        raise ServiceError("invalid_subscription_interval") from None
+                    if "urls" in value:
+                        return await s.subscriptions.import_many(value["urls"], source, interval)
                     url = value["url"]
-                    if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
+                    if not isinstance(url, str):
                         raise ServiceError("invalid_subscription_url")
-                    async with httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False) as client:
-                        try:
-                            content = (await download_limited(client, url, s.settings.max_body_mb * 1024 * 1024)).decode("utf-8-sig")
-                        except (httpx.HTTPError, ValueError):
-                            raise ServiceError("subscription_download_failed", 400) from None
+                    sid = s.subscriptions.save(url, source, interval)
+                    result = await s.subscriptions.refresh(sid)
+                    return {**result, "subscription_id": sid}
                 else:
                     content = value["data"]
                 if not isinstance(content, str):
@@ -196,6 +203,16 @@ async def status(request: Request):
     return request.app.state.service.status()
 
 
+@router.post("/service/enable")
+async def enable_service(request: Request):
+    return await request.app.state.service.set_enabled(True)
+
+
+@router.post("/service/disable")
+async def disable_service(request: Request):
+    return await request.app.state.service.set_enabled(False)
+
+
 @router.get("/count")
 async def count(request: Request, state: Literal["active", "leased"] | None = None, format: Literal["json", "text"] = "json"):
     query = "SELECT COUNT(*) n FROM proxies WHERE port IS NOT NULL AND state "
@@ -225,15 +242,45 @@ async def list_proxies(request: Request, page: int = Query(1, ge=1), page_size: 
         pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         args.extend((pattern, pattern, pattern, q))
     clause = " AND ".join(where)
-    # Do not select raw/config here: secrets stay server-side until explicit copy.
-    fields = "id,protocol,host,remark,source,state,reason,master_id,geo,exit_ip,ping_ms,speed_mbps,udp,fails,port,lease_expires_at,lease_status,cooldown_until,last_check_at,next_check_at,checking"
+    fields = "id,raw AS link,protocol,host,remark,source,state,reason,master_id,geo,exit_ip,ping_ms,speed_mbps,udp,fails,port,lease_expires_at,lease_status,cooldown_until,last_check_at,next_check_at,checking"
     total = s.db.one("SELECT COUNT(*) n FROM proxies WHERE " + clause, args)["n"]
     rows = s.db.rows(f"SELECT {fields} FROM proxies WHERE {clause} ORDER BY {sort} {direction},id {direction} LIMIT ? OFFSET ?", (*args, page_size, (page - 1) * page_size))
     for row in rows:
         host = s.pool.settings.advertise_host
         row["addr"] = (f"[{host}]" if ":" in host else host) + ":" + str(row["port"]) if row["port"] else None
-        row["masked_link"] = f"{row['protocol'] or '?'}://••••@{row['host'] or '—'}"
     return {"items": rows, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/subscriptions")
+async def subscriptions(request: Request):
+    return {"items": request.app.state.service.subscriptions.list()}
+
+
+@router.patch("/subscriptions/{subscription_id}")
+async def subscription_interval(subscription_id: int, body: SubscriptionInterval, request: Request):
+    request.app.state.service.subscriptions.update_interval(subscription_id, body.interval_minutes)
+    return {"ok": True}
+
+
+@router.post("/subscriptions/{subscription_id}/refresh")
+async def refresh_subscription(subscription_id: int, request: Request):
+    return await request.app.state.service.subscriptions.refresh(subscription_id)
+
+
+@router.delete("/subscriptions/{subscription_id}")
+async def delete_subscription(subscription_id: int, request: Request):
+    manager = request.app.state.service.subscriptions
+    manager.get(subscription_id)
+    if subscription_id in manager.running:
+        raise ServiceError("subscription_updating", 409)
+    manager.db.execute("DELETE FROM subscriptions WHERE id=?", (subscription_id,))
+    return {"ok": True}
+
+
+@router.get("/openapi.json", include_in_schema=False)
+async def api_schema(request: Request):
+    from .documentation import build_schema
+    return build_schema(request.app)
 
 
 @router.get("/proxies/{proxy_id}/link")

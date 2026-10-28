@@ -29,6 +29,15 @@ class Database:
             PRAGMA busy_timeout=10000;
             PRAGMA cache_size=-32768;
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS operation_state (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL);
+            INSERT OR IGNORE INTO operation_state VALUES (1, 1);
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL DEFAULT '', interval_minutes INTEGER NOT NULL DEFAULT 60,
+                last_attempt_at REAL, last_success_at REAL, next_update_at REAL,
+                duration_ms INTEGER, last_error TEXT, last_result TEXT,
+                created_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, raw TEXT NOT NULL, config TEXT,
                 protocol TEXT, host TEXT, remark TEXT, source TEXT NOT NULL DEFAULT '',

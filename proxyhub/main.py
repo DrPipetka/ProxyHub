@@ -23,7 +23,7 @@ def create_app(directory=None, core=None, background=True):
         app.state.service = Service(Path(directory) if directory else data_dir(), core=core, background=background)
         app.state.sessions = {}
         app.state.login_attempts = []
-        app.state.import_lock = asyncio.Lock()
+        app.state.import_lock = app.state.service.import_lock
         await app.state.service.start()
         try:
             yield

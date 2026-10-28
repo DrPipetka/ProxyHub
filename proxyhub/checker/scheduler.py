@@ -36,6 +36,8 @@ class Scheduler:
 
     async def claim(self, limit):
         async with self.pool.lock:
+            if not self.pool.enabled:
+                return []
             found = []
             now = time.time()
             # Each branch uses state/schedule indexes. Never load the full queue.

@@ -9,6 +9,7 @@ from .core.xray import XrayAdapter
 from .db import Database, STATES
 from .pool.manager import PoolManager
 from .instance import InstanceLock
+from .subscriptions import Subscriptions
 
 
 class Service:
@@ -22,8 +23,14 @@ class Service:
         self.started = time.time()
         self.core = core or XrayAdapter(self.settings, directory, self.db.event)
         self.pool = PoolManager(self.db, self.settings, self.core)
+        self.pool.enabled = bool(self.db.one("SELECT enabled FROM operation_state WHERE id=1")["enabled"])
+        self.operation_lock = asyncio.Lock()
+        self.transitioning = False
+        self.control_tasks = set()
         self.geo = GeoDatabase()
         self.scheduler = Scheduler(self.db, self.pool, self.core, self.geo)
+        self.import_lock = asyncio.Lock()
+        self.subscriptions = Subscriptions(self)
         self.background = background
         self.tasks = []
         self.restart_required = []
@@ -34,8 +41,44 @@ class Service:
         self.log.setLevel(self.settings.log_level)
 
     async def start(self):
-        if self.background:
-            self.tasks = [asyncio.create_task(self.initialize_loop()), asyncio.create_task(self.scheduler.run()), asyncio.create_task(self.maintenance())]
+        if self.background and self.pool.enabled and not self.tasks:
+            self.tasks = [asyncio.create_task(self.initialize_loop()), asyncio.create_task(self.scheduler.run()), asyncio.create_task(self.maintenance()), asyncio.create_task(self.subscriptions.run())]
+
+    async def cancel_workers(self):
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+
+    async def set_enabled(self, enabled):
+        # Finish the transition even if the requesting browser disconnects.
+        task = asyncio.create_task(self._set_enabled(enabled))
+        self.control_tasks.add(task)
+        task.add_done_callback(self.control_tasks.discard)
+        return await asyncio.shield(task)
+
+    async def _set_enabled(self, enabled):
+        async with self.operation_lock:
+            if self.pool.enabled and enabled:
+                return self.status()
+            self.transitioning = True
+            try:
+                self.db.execute("UPDATE operation_state SET enabled=? WHERE id=1", (int(enabled),))
+                self.pool.enabled = enabled
+                if enabled:
+                    await self.start()
+                else:
+                    await self.cancel_workers()
+                    async with self.pool.lock:
+                        await self.core.close()
+                        self.db.recover()
+                        self.pool.ports.used.clear()
+                        self.scheduler.ports.used.clear()
+                        self.scheduler.reservations.clear()
+                self.db.event("Работа прокси включена" if enabled else "Работа прокси отключена; подключения закрыты")
+            finally:
+                self.transitioning = False
+            return self.status()
 
     async def initialize_loop(self):
         async def initialize_core():
@@ -87,7 +130,9 @@ class Service:
         count = self.db.one("SELECT COUNT(*) n FROM proxies WHERE port IS NOT NULL")["n"]
         queue = self.db.one("SELECT COUNT(*) n FROM proxies WHERE checking=0 AND (manual_check=1 OR (state IN ('new','invalid','valid','active','leased') AND next_check_at<=?))", (time.time(),))["n"]
         from . import __version__
-        return {"version": __version__, "uptime": round(time.time() - self.started), "xray": {"ready": self.core.ready, "version": self.core.version, "protocols": sorted(self.core.protocols)},
+        return {"version": __version__, "uptime": round(time.time() - self.started),
+                "operation": {"enabled": self.pool.enabled, "transitioning": self.transitioning},
+                "xray": {"ready": self.pool.enabled and self.core.ready, "version": self.core.version, "protocols": sorted(self.core.protocols)},
                 "states": counters, "raised": count, "free": counters["active"], "leased": counters["leased"], "queue": queue,
                 "checking": self.scheduler.running, "checks_per_minute": sum(t > time.time() - 60 for t in self.scheduler.completed),
                 "ports": {"pool_used": len(self.pool.ports.used), "check_used": len(self.scheduler.ports.used), "pool_capacity": self.pool.ports.span[1] - self.pool.ports.span[0] + 1},
@@ -96,9 +141,8 @@ class Service:
                 "last_errors": self.db.rows("SELECT * FROM events WHERE level IN ('WARNING','ERROR') ORDER BY id DESC LIMIT 10")}
 
     async def close(self):
-        for task in self.tasks:
-            task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*self.control_tasks, return_exceptions=True)
+        await self.cancel_workers()
         await self.core.close()
         self.geo.close()
         self.db.recover()

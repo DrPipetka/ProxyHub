@@ -1,11 +1,2 @@
-https://raw.githubusercontent.com/iboxz/free-v2ray-collector/main/main/mix.txt
-https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-all.txt
-
-
-
-
-
-
-
-
-
+Парсить, хуева тьма конфигов
+https://github.com/asgharkapk/Sub-Config-Extractor
