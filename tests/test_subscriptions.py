@@ -8,6 +8,80 @@ from proxyhub.pool.lease import ServiceError
 from test_api import client_for
 
 
+@pytest.mark.parametrize('url,download_url', [
+    ('https://github.com/owner/repo/blob/main/server.txt',
+     'https://raw.githubusercontent.com/owner/repo/main/server.txt'),
+    ('https://github.com/owner/repo/raw/refs/heads/main/sub/list.txt?token=example#file',
+     'https://raw.githubusercontent.com/owner/repo/refs/heads/main/sub/list.txt?token=example'),
+    ('https://raw.githubusercontent.com/owner/repo/main/server.txt',
+     'https://raw.githubusercontent.com/owner/repo/main/server.txt'),
+])
+def test_github_file_urls_download_raw_content(tmp_path, monkeypatch, url, download_url):
+    calls = []
+
+    async def download(client, target, limit):
+        calls.append(target)
+        return b'trojan://secret@example.com:443'
+
+    monkeypatch.setattr('proxyhub.subscriptions.download_limited', download)
+    with client_for(tmp_path) as c:
+        c.post('/auth/login', json={})
+        assert c.post('/proxies', json={'url': url, 'interval_minutes': 0}).json()['accepted'] == 1
+        assert calls == [download_url]
+        assert c.get('/subscriptions').json()['items'][0]['url'] == url
+
+
+@pytest.mark.parametrize('url', [
+    'https://github.com/owner/repo', 'https://github.com/owner/repo/',
+    'https://github.com/owner/repo/tree/main/sub',
+])
+def test_github_repository_is_not_a_subscription(tmp_path, url):
+    with client_for(tmp_path) as c:
+        c.post('/auth/login', json={})
+        response = c.post('/proxies', json={'url': url})
+        assert response.status_code == 400
+        assert response.json()['error'] == 'subscription_file_required'
+        assert c.get('/subscriptions').json()['items'] == []
+        assert c.get('/proxies').json()['total'] == 0
+
+
+@pytest.mark.parametrize('content,expected_error', [
+    (b'<!doctype html>\n<html>\n<body>secret</body>\n</html>', 'subscription_html_content'),
+    (b'not a config\nstill not a config', 'subscription_invalid_content'),
+])
+def test_failed_subscription_refresh_does_not_pollute_database(tmp_path, monkeypatch, content, expected_error):
+    async def download(*args):
+        return content
+
+    monkeypatch.setattr('proxyhub.subscriptions.download_limited', download)
+    with client_for(tmp_path) as c:
+        c.post('/auth/login', json={})
+        payload = {'url': 'https://example.com/sub', 'interval_minutes': 0}
+        for _ in range(2):
+            response = c.post('/proxies', json=payload)
+            assert response.status_code == 400
+            assert response.json()['error'] == expected_error
+            assert 'secret' not in response.text
+        assert c.get('/proxies').json()['total'] == 0
+        assert c.get('/subscriptions').json()['items'][0]['last_error'] == expected_error
+
+
+def test_mixed_subscription_reports_bad_lines_without_storing_them(tmp_path, monkeypatch):
+    async def download(*args):
+        return b'trojan://secret@example.com:443\nbroken'
+
+    monkeypatch.setattr('proxyhub.subscriptions.download_limited', download)
+    with client_for(tmp_path) as c:
+        c.post('/auth/login', json={})
+        payload = {'url': 'https://example.com/sub', 'interval_minutes': 0}
+        for accepted, duplicates in [(1, 0), (0, 1)]:
+            result = c.post('/proxies', json=payload).json()
+            assert result['accepted'] == accepted and result['duplicates'] == duplicates
+            assert result['received'] == 2 and result['parse_errors'] == 1
+            assert result['errors'][0]['line'] == 2
+            assert c.get('/proxies').json()['total'] == 1
+
+
 def test_bulk_subscription_import_partial_failure_and_duplicates(tmp_path, monkeypatch):
     calls = []
 

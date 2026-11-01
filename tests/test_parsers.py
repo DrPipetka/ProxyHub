@@ -78,3 +78,16 @@ def test_error_list_bounded_and_raw_preserved(db):
     assert result["parse_errors"] == 120
     assert len(result["errors"]) == 100
     assert db.one("SELECT raw FROM proxies LIMIT 1")["raw"] == "bad"
+
+
+@pytest.mark.parametrize("data", [
+    '\ufeff\n<!DOCTYPE html>\n<html>\n<body>vless://fake</body>\n</html>',
+    '<!-- GitHub -->\n<HTML lang="en">\n<head></head>\n</HTML>',
+    '<html><script>const example = "proxies:";</script></html>',
+    b64('<html><body>Access denied</body></html>'),
+])
+def test_html_is_rejected_without_storing_page_lines(db, data):
+    result = import_configs(db, data)
+    assert result["received"] == result["parse_errors"] == 1
+    assert result["errors"][0]["reason"].startswith("html_document:")
+    assert db.one("SELECT COUNT(*) n FROM proxies")["n"] == 0

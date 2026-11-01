@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sqlite3
 import time
 
@@ -12,6 +13,12 @@ from .links import b64decode, parse_link
 from .singbox import parse_singbox
 
 
+def is_html(data: str) -> bool:
+    """Recognize markup before splitting a downloaded web page into config lines."""
+    return bool(re.match(r"\s*(?:<!--.*?-->\s*)*<(?:!doctype\s+html\b|/?[a-z][\w:-]*(?:\s|/?>))",
+                         data.lstrip("\ufeff"), re.IGNORECASE | re.DOTALL))
+
+
 def entries(data: str):
     data = data.strip("\ufeff \r\n\t")
     if not data:
@@ -19,11 +26,13 @@ def entries(data: str):
     if "://" not in data and not data.startswith(("{", "[", "proxies:")):
         try:
             decoded = b64decode("".join(data.split()))
-            if "://" in decoded:
+            if "://" in decoded or is_html(decoded):
                 data = decoded
         except (ValueError, UnicodeError):
             pass
-    if data.startswith(("{", "[")) or ("proxies:" in data and not data.startswith(("vless://", "vmess://", "ss://", "trojan://", "hy2://", "hysteria2://", "tuic://"))):
+    if is_html(data):
+        yield 1, data, None, None
+    elif data.startswith(("{", "[")) or ("proxies:" in data and not data.startswith(("vless://", "vmess://", "ss://", "trojan://", "hy2://", "hysteria2://", "tuic://"))):
         try:
             value = json.loads(data) if data.startswith(("{", "[")) else yaml.safe_load(data)
             if not isinstance(value, dict):
@@ -44,7 +53,7 @@ def entries(data: str):
                 yield n, line, parse_link, line
 
 
-def import_configs(db, data, source="", protocols=None):
+def import_configs(db, data, source="", protocols=None, *, persist_errors=True):
     protocols = protocols or {"vless", "vmess", "ss", "trojan"}
     counts = dict(received=0, accepted=0, duplicates=0, unsupported=0, parse_errors=0, errors=[])
     batch = []
@@ -75,6 +84,12 @@ def import_configs(db, data, source="", protocols=None):
             row = (config.hash, raw, json.dumps(config.asdict()), config.protocol, config.host, config.remark, source,
                    "unsupported" if reason else "new", reason, now, now)
         except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+            if not persist_errors or is_html(raw):
+                counts["parse_errors"] += 1
+                if len(counts["errors"]) < 100:
+                    reason = "html_document: укажите Raw-ссылку на файл подписки" if is_html(raw) else "invalid_config: проверьте формат и обязательные поля"
+                    counts["errors"].append({"line": n, "outcome": "parse_error", "reason": reason})
+                continue
             # Parser exceptions may contain passwords; keep only a fixed public message.
             row = (None, raw, None, None, None, "", source, "parse_error", "invalid_config: проверьте формат и обязательные поля", now, now)
         batch.append((n, row))

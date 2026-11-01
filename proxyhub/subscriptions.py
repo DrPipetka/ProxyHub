@@ -2,13 +2,24 @@
 import asyncio
 import json
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from .core.installer import download_limited
-from .parsers import import_configs
+from .parsers import import_configs, is_html
 from .pool.lease import ServiceError
+
+
+def subscription_download_url(url):
+    """GitHub file viewer URLs must download the file, never its HTML viewer."""
+    parts = urlsplit(url)
+    if parts.hostname not in {"github.com", "www.github.com"}:
+        return url
+    path = parts.path.strip("/").split("/")
+    if len(path) < 5 or path[2] not in {"blob", "raw"}:
+        raise ServiceError("subscription_file_required", message="Укажите ссылку на файл подписки (Raw), а не на репозиторий или папку GitHub")
+    return urlunsplit(("https", "raw.githubusercontent.com", "/" + "/".join(path[:2] + path[3:]), parts.query, ""))
 
 
 class Subscriptions:
@@ -38,6 +49,7 @@ class Subscriptions:
             valid = False
         if not valid:
             raise ServiceError("invalid_subscription_url")
+        subscription_download_url(url)
         existing = self.db.one("SELECT id FROM subscriptions WHERE url=?", (url,))
         if existing and existing["id"] in self.running:
             raise ServiceError("subscription_updating", 409)
@@ -93,12 +105,14 @@ class Subscriptions:
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False) as client:
                 try:
-                    data = (await download_limited(client, row["url"], self.service.settings.max_body_mb * 1024 * 1024)).decode("utf-8-sig")
+                    data = (await download_limited(client, subscription_download_url(row["url"]), self.service.settings.max_body_mb * 1024 * 1024)).decode("utf-8-sig")
                 except (httpx.HTTPError, ValueError, UnicodeError):
                     raise ServiceError("subscription_download_failed", 400) from None
+            if is_html(data):
+                raise ServiceError("subscription_html_content", message="Вместо конфигов получена HTML-страница. Укажите Raw-ссылку на файл подписки")
             async with self.service.import_lock:
                 # Keep shutdown from closing SQLite while the import thread is still using it.
-                task = asyncio.create_task(asyncio.to_thread(import_configs, self.db, data, row["source"], set(self.service.core.protocols)))
+                task = asyncio.create_task(asyncio.to_thread(import_configs, self.db, data, row["source"], set(self.service.core.protocols), persist_errors=False))
                 try:
                     result = await asyncio.shield(task)
                 except asyncio.CancelledError:
