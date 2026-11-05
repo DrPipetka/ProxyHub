@@ -2,6 +2,7 @@
 import asyncio
 import os
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -121,3 +122,135 @@ async def test_real_batch_uses_one_process_and_frees_ports(tmp_path):
             await asyncio.open_connection('127.0.0.1', p2)
     finally:
         await core.close()
+
+
+async def vless_http_peer(reader, writer):
+    try:
+        # Minimal local VLESS peer: validate the request and return a real HTTP response.
+        header = await reader.readexactly(18)
+        assert header[0] == 0 and header[1:17].hex() == UUID.replace('-', '')
+        await reader.readexactly(header[17])
+        request = await reader.readexactly(4)
+        assert request[0] == 1  # TCP
+        address_size = {1: 4, 3: 16}.get(request[3])
+        if request[3] == 2:
+            address_size = (await reader.readexactly(1))[0]
+        await reader.readexactly(address_size)
+        writer.write(b'\x00\x00')
+        await writer.drain()
+        await reader.readuntil(b'\r\n\r\n')
+        writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok')
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.parametrize('auth', [False, True])
+async def test_permanent_switch_keeps_listener_and_routes_new_connections(tmp_path, auth):
+    import httpx
+    from proxyhub.pool.permanent import PermanentProxy
+
+    server = await asyncio.start_server(vless_http_peer, '127.0.0.1', 0)
+    upstream_port = server.sockets[0].getsockname()[1]
+    target = 80
+    ports = PortAllocator((23000, 23999))
+    fixed, other_port = ports.take(), ports.take()
+    settings = Settings(xray_path=str(BIN), auto_download=False, socks_auth=auth,
+                        socks_username='user@:', socks_password='pass@:/', ping_urls=[f'http://127.0.0.1:{target}'])
+    core = XrayAdapter(settings, tmp_path)
+
+    def proxy(port):
+        return httpx.Proxy(f'socks5://127.0.0.1:{port}', auth=(settings.socks_username, settings.socks_password) if auth else None)
+    bad = parse_link(f'vless://{UUID}@127.0.0.1:1?security=none').asdict()
+    good = {**bad, 'port': upstream_port}
+    writer = None
+    try:
+        await core.initialize()
+        await core.add(0, bad, fixed)
+        await core.add(1, good, other_port)
+        async with httpx.AsyncClient(proxy=proxy(other_port), trust_env=False, timeout=5) as client:
+            assert (await client.get(f'http://127.0.0.1:{target}')).text == 'ok'
+        await core.remove(1)
+        pid = core.pool.pid
+        reader, writer = await asyncio.open_connection('127.0.0.1', fixed)
+        writer.write(b'\x05\x01\x02' if auth else b'\x05\x01\x00')
+        await writer.drain()
+        assert await reader.readexactly(2) == (b'\x05\x02' if auth else b'\x05\x00')
+        if auth:
+            username, password = settings.socks_username.encode(), settings.socks_password.encode()
+            writer.write(bytes([1, len(username)]) + username + bytes([len(password)]) + password)
+            await writer.drain()
+            assert await reader.readexactly(2) == b'\x01\x00'
+        await core.replace(0, good, fixed)
+        # This socket was accepted before the change; the same inbound is still serving it.
+        writer.write(b'\x05\x01\x00\x01\x7f\x00\x00\x01' + target.to_bytes(2, 'big'))
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.readexactly(10), 5)
+        assert reply[1] == 0
+        writer.write(b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+        await writer.drain()
+        assert b'200 OK' in await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 5)
+        assert await asyncio.wait_for(reader.readexactly(2), 5) == b'ok'
+        assert core.pool.pid == pid
+        await core.add(1, bad, other_port)
+        await core.remove(1)
+        assert await PermanentProxy(None).probe(settings, fixed)
+        async with httpx.AsyncClient(proxy=proxy(fixed), trust_env=False, timeout=5) as client:
+            assert (await client.get(f'http://127.0.0.1:{target}')).text == 'ok'
+        await core._restart_pool()
+        async with httpx.AsyncClient(proxy=proxy(fixed), trust_env=False, timeout=5) as client:
+            assert (await client.get(f'http://127.0.0.1:{target}')).text == 'ok'
+    finally:
+        if writer:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
+        await core.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_permanent_recovers_same_port_after_core_crash(tmp_path):
+    from proxyhub.parsers import import_configs
+    from proxyhub.service import Service
+
+    upstream = await asyncio.start_server(vless_http_peer, '127.0.0.1', 0)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    service = Service(tmp_path)
+    s = service.settings
+    s.xray_path, s.auto_download = str(BIN), False
+    s.measure_geo, s.measure_ping, s.dedupe_by_exit_ip = False, False, False
+    s.pool_size = 0
+    s.permanent_port = PortAllocator((24000, 24999)).take()
+    s.permanent_proxy = True
+    s.ping_urls = ['http://127.0.0.1:80']
+    service.scheduler.direct_checked = time.time()
+    import_configs(service.db, f'vless://{UUID}@127.0.0.1:{upstream_port}?security=none')
+    service.db.execute("UPDATE proxies SET state='valid',next_check_at=?", (time.time() + 3600,))
+
+    async def ready():
+        while not service.pool.permanent.status()['ready']:
+            await asyncio.sleep(0.05)
+        return service.pool.permanent.status()
+
+    async def restarted(process):
+        while service.core.pool is process:
+            await asyncio.sleep(0.05)
+
+    try:
+        await service.start()
+        first = await asyncio.wait_for(ready(), 15)
+        process = service.core.pool
+        process.kill()
+        await process.wait()
+        # Wait for maintenance to notice the crash before observing readiness again.
+        await asyncio.wait_for(restarted(process), 15)
+        recovered = await asyncio.wait_for(ready(), 15)
+        assert recovered['addr'] == first['addr']
+        assert recovered['proxy']['id'] == first['proxy']['id']
+        assert service.core.pool.pid != process.pid
+    finally:
+        await service.close()
+        upstream.close()
+        await upstream.wait_closed()

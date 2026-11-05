@@ -24,6 +24,9 @@ class CoreAdapter(ABC):
     async def add(self, proxy_id, config, port): ...
 
     @abstractmethod
+    async def replace(self, proxy_id, config, port): ...
+
+    @abstractmethod
     async def remove(self, proxy_id): ...
 
     @abstractmethod

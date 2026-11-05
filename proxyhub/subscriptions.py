@@ -27,6 +27,13 @@ class Subscriptions:
         self.service = service
         self.db = service.db
         self.running = set()
+        self.generation = 0
+
+    def delete_all(self):
+        """Called under import_lock; invalidate queued imports and in-flight downloads."""
+        deleted = self.db.execute("DELETE FROM subscriptions").rowcount
+        self.generation += 1
+        return deleted
 
     def get(self, sid):
         row = self.db.one("SELECT * FROM subscriptions WHERE id=?", (sid,))
@@ -74,11 +81,14 @@ class Subscriptions:
         if not unique:
             raise ServiceError("invalid_subscription_urls", message="Список URL подписок пуст")
         slots = asyncio.Semaphore(4)
+        generation = self.generation
 
         async def load(url):
             async with slots:
                 item = {"url": url, "subscription_id": None}
                 try:
+                    if generation != self.generation:
+                        raise ServiceError("subscriptions_deleted", 409, "Подписки удалены; импорт остановлен")
                     sid = self.save(url, source, interval)
                     item["subscription_id"] = sid
                     return {**item, "ok": True, **await self.refresh(sid)}
@@ -111,6 +121,9 @@ class Subscriptions:
             if is_html(data):
                 raise ServiceError("subscription_html_content", message="Вместо конфигов получена HTML-страница. Укажите Raw-ссылку на файл подписки")
             async with self.service.import_lock:
+                # A bulk deletion can finish while the subscription is downloading.
+                # Never let that old response repopulate the cleared library.
+                self.get(sid)
                 # Keep shutdown from closing SQLite while the import thread is still using it.
                 task = asyncio.create_task(asyncio.to_thread(import_configs, self.db, data, row["source"], set(self.service.core.protocols), persist_errors=False))
                 try:
@@ -133,9 +146,11 @@ class Subscriptions:
             self.db.event(f"Подписка #{sid}: subscription_update_failed", level="ERROR")
             raise ServiceError("subscription_update_failed", 500) from None
         finally:
-            interval = self.get(sid)["interval_minutes"]
-            self.db.execute("UPDATE subscriptions SET duration_ms=?,next_update_at=? WHERE id=?",
-                            (round((time.monotonic() - started) * 1000), time.time() + interval * 60 if interval else None, sid))
+            current = self.db.one("SELECT interval_minutes FROM subscriptions WHERE id=?", (sid,))
+            if current:
+                interval = current["interval_minutes"]
+                self.db.execute("UPDATE subscriptions SET duration_ms=?,next_update_at=? WHERE id=?",
+                                (round((time.monotonic() - started) * 1000), time.time() + interval * 60 if interval else None, sid))
             self.running.discard(sid)
 
     async def tick(self):

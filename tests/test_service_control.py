@@ -82,7 +82,7 @@ async def test_stop_cancels_checks_and_subscriptions_then_resumes(tmp_path, monk
         assert not service.core.entries
         # A successful enable starts only one set of workers, including when requested concurrently.
         await asyncio.gather(service.set_enabled(True), service.set_enabled(True))
-        assert len(service.tasks) == 4
+        assert len(service.tasks) == 5
         await service.set_enabled(False)
     finally:
         await service.close()
@@ -97,7 +97,7 @@ async def test_disabled_start_has_no_background_workers(tmp_path):
         await service.start()
         assert not service.tasks and not service.pool.enabled
         await service.set_enabled(True)
-        assert len(service.tasks) == 4
+        assert len(service.tasks) == 5
     finally:
         await service.close()
 

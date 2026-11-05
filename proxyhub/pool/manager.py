@@ -8,6 +8,7 @@ import time
 from ..core.adapter import CoreError
 from ..core.xray import PortAllocator
 from .lease import ServiceError
+from .permanent import PermanentProxy
 
 
 class PoolManager:
@@ -16,6 +17,7 @@ class PoolManager:
         self.lock = asyncio.Lock()
         self.enabled = True
         self.ports = PortAllocator(settings.pool_port_range, settings.bind_address)
+        self.permanent = PermanentProxy(self)
 
     def get(self, proxy_id):
         row = self.db.one("SELECT * FROM proxies WHERE id=?", (proxy_id,))
@@ -43,6 +45,9 @@ class PoolManager:
         f, s = filters or {}, self.settings
         where = ["state IN (" + ",".join("?" for _ in states) + ")", "checking=0"]
         args = list(states)
+        if self.permanent.proxy_id is not None:
+            where.append("id<>?")
+            args.append(self.permanent.proxy_id)
         countries = f.get("geo") or (s.pool_geo if s.select_mode == "geo" else [])
         if countries:
             where.append("geo IN (" + ",".join("?" for _ in countries) + ")")
@@ -77,6 +82,8 @@ class PoolManager:
         return self.get(row["id"])
 
     async def _close(self, row):
+        if self.permanent.proxy_id == row["id"]:
+            await self.permanent.stop()
         if row["port"] is not None:
             await self.core.remove(row["id"])
             self.ports.release(row["port"])
@@ -182,7 +189,7 @@ class PoolManager:
                 where, args = "source=?", (source,)
             elif scope != "all":
                 raise ServiceError("invalid_scope")
-            for row in self.db.rows("SELECT * FROM proxies WHERE port IS NOT NULL AND " + where, args):
+            for row in self.db.rows("SELECT * FROM proxies WHERE (port IS NOT NULL OR id=?) AND " + where, (self.permanent.proxy_id, *args)):
                 await self._close(row)
             # SQL subquery avoids materializing a 100k-row deletion set.
             with self.db.transaction() as c:

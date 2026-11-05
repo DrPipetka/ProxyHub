@@ -29,6 +29,9 @@ class Settings(BaseModel):
     pool_geo: list[str] = Field(default_factory=list)
     best_sort: Literal["balanced", "speed", "ping"] = "balanced"
     on_demand: bool = True
+    permanent_proxy: bool = False
+    permanent_port: int = Field(1080, ge=1024, le=65535)
+    permanent_check_seconds: int = Field(30, ge=5, le=3600)
     lease_ttl: int = Field(600, ge=1, le=604800)
     cooldown_minutes: float = Field(30, ge=0)
     recheck_after_cooldown: bool = True
@@ -73,6 +76,8 @@ class Settings(BaseModel):
                 raise ValueError("Порт UI попадает в диапазон SOCKS")
         if max(a[0], b[0]) <= min(a[1], b[1]):
             raise ValueError("Диапазоны портов пересекаются")
+        if self.permanent_proxy and (self.permanent_port == self.web_port or any(lo <= self.permanent_port <= hi for lo, hi in (a, b))):
+            raise ValueError("Постоянный порт должен отличаться от порта UI и диапазонов пула/проверок")
         if self.pool_size > a[1] - a[0] + 1:
             raise ValueError("Пул больше диапазона портов")
         if self.check_concurrency > b[1] - b[0] + 1:

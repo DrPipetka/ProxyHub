@@ -1,2 +1,0 @@
-Парсить, хуева тьма конфигов
-https://github.com/asgharkapk/Sub-Config-Extractor

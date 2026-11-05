@@ -28,6 +28,10 @@ class FakeCore:
     async def remove(self, pid):
         self.entries.pop(pid, None)
 
+    async def replace(self, pid, config, port):
+        assert pid in self.entries and self.entries[pid][1] == port
+        self.entries[pid] = (config, port)
+
     @asynccontextmanager
     async def batch(self, entries):
         self.batches.append(entries)

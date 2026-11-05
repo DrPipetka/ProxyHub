@@ -27,6 +27,7 @@ class Service:
         self.operation_lock = asyncio.Lock()
         self.transitioning = False
         self.control_tasks = set()
+        self.core_wakeup = asyncio.Event()
         self.geo = GeoDatabase()
         self.scheduler = Scheduler(self.db, self.pool, self.core, self.geo)
         self.import_lock = asyncio.Lock()
@@ -42,7 +43,7 @@ class Service:
 
     async def start(self):
         if self.background and self.pool.enabled and not self.tasks:
-            self.tasks = [asyncio.create_task(self.initialize_loop()), asyncio.create_task(self.scheduler.run()), asyncio.create_task(self.maintenance()), asyncio.create_task(self.subscriptions.run())]
+            self.tasks = [asyncio.create_task(self.initialize_loop()), asyncio.create_task(self.scheduler.run()), asyncio.create_task(self.maintenance()), asyncio.create_task(self.subscriptions.run()), asyncio.create_task(self.pool.permanent.run())]
 
     async def cancel_workers(self):
         for task in self.tasks:
@@ -71,6 +72,7 @@ class Service:
                     await self.cancel_workers()
                     async with self.pool.lock:
                         await self.core.close()
+                        self.pool.permanent.reset()
                         self.db.recover()
                         self.pool.ports.used.clear()
                         self.scheduler.ports.used.clear()
@@ -88,6 +90,7 @@ class Service:
                 self.db.execute("UPDATE proxies SET state='new',reason=NULL,next_check_at=0 WHERE protocol='hysteria2' AND state='unsupported' AND reason IN ('protocol_not_supported:hysteria2','unsupported:protocol_not_supported:hysteria2')")
 
         while True:
+            self.core_wakeup.clear()
             resources = []
             if not self.core.ready and not self.scheduler.running:
                 resources.append(("xray", initialize_core()))
@@ -100,7 +103,10 @@ class Service:
                 if isinstance(result, Exception):
                     self.db.event("Инициализация " + name + ": " + type(result).__name__ + "; повтор через 30 секунд", level="ERROR")
                     self.log.error("Resource %s initialization failed: %s", name, type(result).__name__)
-            await asyncio.sleep(30)
+            try:
+                await asyncio.wait_for(self.core_wakeup.wait(), 1 if not self.core.ready and self.scheduler.running else 30)
+            except TimeoutError:
+                pass
 
     async def maintenance(self):
         while True:
@@ -110,12 +116,16 @@ class Service:
                     async with self.pool.lock:
                         self.core.ready = False
                         self.core.entries.clear()
+                        self.pool.permanent.reset()
+                        if hasattr(self.core, "outbound_tags"):
+                            self.core.outbound_tags.clear()
                         self.pool.ports.used.clear()
                         for row in self.db.rows("SELECT id FROM proxies WHERE state='leased' AND port IS NOT NULL"):
                             self.db.release_duplicates(row["id"])
                         self.db.execute("UPDATE proxies SET state='invalid',reason='connect_fail',lease_status='broken',lease_expires_at=NULL,port=NULL,checking=0,revision=revision+1,next_check_at=? WHERE state='leased' AND port IS NOT NULL", (time.time() + self.settings.fail_retry_minutes * 60,))
                         self.db.execute("UPDATE proxies SET state='valid',port=NULL,checking=0,revision=revision+1 WHERE state='active'")
                         self.db.event("Процесс пула завершился; аренды прерваны, запускается восстановление", level="ERROR")
+                        self.core_wakeup.set()
                 await self.pool.tick()
             except asyncio.CancelledError:
                 raise
@@ -137,6 +147,7 @@ class Service:
                 "checking": self.scheduler.running, "checks_per_minute": sum(t > time.time() - 60 for t in self.scheduler.completed),
                 "ports": {"pool_used": len(self.pool.ports.used), "check_used": len(self.scheduler.ports.used), "pool_capacity": self.pool.ports.span[1] - self.pool.ports.span[0] + 1},
                 "pool": {k: getattr(self.pool.settings, k) for k in ("pool_size", "select_mode", "best_sort", "on_demand")},
+                "permanent_proxy": self.pool.permanent.status(),
                 "direct_ip": self.scheduler.direct_ip, "geo_ready": bool(self.geo.reader), "restart_required": self.restart_required,
                 "last_errors": self.db.rows("SELECT * FROM events WHERE level IN ('WARNING','ERROR') ORDER BY id DESC LIMIT 10")}
 

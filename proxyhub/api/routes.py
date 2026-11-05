@@ -7,7 +7,7 @@ import time
 from html import escape
 from datetime import datetime
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
@@ -195,7 +195,39 @@ async def delete(request: Request, confirm: str = "", scope: Literal["all", "inv
     if confirm != "yes":
         raise ServiceError("confirmation_required")
     async with request.app.state.import_lock:
-        return {"deleted": await request.app.state.service.pool.delete(scope, source)}
+        s = request.app.state.service
+        deleted = await s.pool.delete(scope, source)
+        subscriptions_deleted = s.subscriptions.delete_all() if scope == "all" else 0
+        return {"deleted": deleted, "subscriptions_deleted": subscriptions_deleted}
+
+
+def export_response(items, kind, format):
+    filename = f"proxyhub-{kind}.{format}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if format == "json":
+        return JSONResponse(items, headers=headers)
+    return PlainTextResponse("".join(item + "\n" for item in items), headers=headers)
+
+
+@router.get("/export/proxies", response_class=PlainTextResponse)
+async def export_proxies(request: Request, format: Literal["txt", "json"] = "txt"):
+    s = request.app.state.service
+    settings = s.pool.settings
+    host = settings.advertise_host
+    host = f"[{host}]" if ":" in host else host
+    auth = f"{quote(settings.socks_username, safe='')}:{quote(settings.socks_password, safe='')}@" if settings.socks_auth else ""
+    rows = s.db.rows("SELECT port FROM proxies WHERE port IS NOT NULL AND state IN ('active','leased') ORDER BY id")
+    ports = [row["port"] for row in rows]
+    if s.pool.permanent.port is not None:
+        ports.append(s.pool.permanent.port)
+    items = [f"socks5://{auth}{host}:{port}" for port in ports]
+    return export_response(items, "proxies", format)
+
+
+@router.get("/export/configs", response_class=PlainTextResponse)
+async def export_configs(request: Request, format: Literal["txt", "json"] = "txt"):
+    rows = request.app.state.service.db.rows("SELECT raw FROM proxies ORDER BY id")
+    return export_response([row["raw"] for row in rows], "configs", format)
 
 
 @router.get("/status")
@@ -218,6 +250,15 @@ async def count(request: Request, state: Literal["active", "leased"] | None = No
     query = "SELECT COUNT(*) n FROM proxies WHERE port IS NOT NULL AND state "
     row = request.app.state.service.db.one(query + ("=?" if state else "IN ('active','leased')"), (state,) if state else ())
     return PlainTextResponse(str(row["n"])) if format == "text" else {"count": row["n"]}
+
+
+@router.post("/permanent-proxy/switch")
+async def switch_permanent_proxy(request: Request):
+    service = request.app.state.service
+    task = asyncio.create_task(service.pool.permanent.switch())
+    service.control_tasks.add(task)
+    task.add_done_callback(service.control_tasks.discard)
+    return await asyncio.shield(task)
 
 
 @router.get("/proxies")
@@ -254,6 +295,14 @@ async def list_proxies(request: Request, page: int = Query(1, ge=1), page_size: 
 @router.get("/subscriptions")
 async def subscriptions(request: Request):
     return {"items": request.app.state.service.subscriptions.list()}
+
+
+@router.delete("/subscriptions")
+async def delete_subscriptions(request: Request, confirm: str = ""):
+    if confirm != "yes":
+        raise ServiceError("confirmation_required")
+    async with request.app.state.import_lock:
+        return {"deleted": request.app.state.service.subscriptions.delete_all()}
 
 
 @router.patch("/subscriptions/{subscription_id}")
@@ -333,6 +382,11 @@ async def save_settings(request: Request):
             live = Settings.model_validate(runtime_values)
         except ValidationError:
             raise ServiceError("restart_settings_conflict", 409, "Сначала измените диапазоны и перезапустите приложение, затем размер пула/параллелизм") from None
+        permanent = service.pool.permanent
+        if live.permanent_proxy and permanent.port != live.permanent_port and not port_available(live.permanent_port, live.bind_address):
+            raise ServiceError("ports_in_use", 409, "Порт постоянного прокси занят")
+        if permanent.port is not None and (not live.permanent_proxy or permanent.port != live.permanent_port):
+            await permanent.stop()
         service.db.save_settings(new)
         service.settings, service.pool.settings = new, live
         service.core.settings = live

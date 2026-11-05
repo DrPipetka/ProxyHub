@@ -7,3 +7,46 @@ bin/
 dist/
 build/
 .tmp/
+
+# Local subscriptions, imported configs and exports (contain access credentials).
+_Configs/
+exports/
+proxyhub-proxies*.txt
+proxyhub-proxies*.json
+proxyhub-configs*.txt
+proxyhub-configs*.json
+
+# Runtime databases, SQLite sidecars, logs and backups, including custom data dirs.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.log.*
+*.bak
+*.backup
+backups/
+runtime/
+
+# Local environment, saved credentials and private keys.
+.env
+.env.*
+!.env.example
+!.env.sample
+.secrets/
+secrets/
+credentials/
+passwords/
+*password*.txt
+*password*.json
+*credentials*.json
+*credentials*.txt
+*secrets*.json
+*secrets*.txt
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/

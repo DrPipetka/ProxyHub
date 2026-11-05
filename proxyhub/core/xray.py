@@ -73,7 +73,7 @@ def inbound(port, tag, settings=None):
     return {"tag": tag, "listen": settings.bind_address if settings else "127.0.0.1", "port": port, "protocol": "socks", "settings": auth}
 
 
-def build_config(entries, settings=None, api_port=None):
+def build_config(entries, settings=None, api_port=None, outbound_tags=None):
     # A blocked default prevents accidental direct traffic when a route is absent.
     config = {"log": {"loglevel": "none"}, "inbounds": [], "outbounds": [{"tag": "blocked", "protocol": "blackhole"}],
               "routing": {"domainStrategy": "AsIs", "rules": []}}
@@ -83,9 +83,10 @@ def build_config(entries, settings=None, api_port=None):
         config["routing"]["rules"].append({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"})
     for proxy_id, c, port in entries:
         tag = f"p{proxy_id}"
+        out_tag = (outbound_tags or {}).get(proxy_id, tag)
         config["inbounds"].append(inbound(port, tag, settings))
-        config["outbounds"].append(outbound(c, tag))
-        config["routing"]["rules"].append({"type": "field", "inboundTag": [tag], "outboundTag": tag})
+        config["outbounds"].append(outbound(c, out_tag))
+        config["routing"]["rules"].append({"type": "field", "inboundTag": [tag], "outboundTag": out_tag})
     return config
 
 
@@ -128,6 +129,7 @@ class XrayAdapter(CoreAdapter):
         self.processes = {}
         self.pool = None
         self.entries = {}
+        self.outbound_tags = {}
         self.api_port = None
         self.lock = asyncio.Lock()
         self.protocols = set(CoreAdapter.protocols)
@@ -295,8 +297,36 @@ class XrayAdapter(CoreAdapter):
 
     async def _restart_pool(self):
         await self._stop(self.pool)
-        self.pool = await self._start(build_config(list(self.entries.values()), self.settings, self.api_port), [("127.0.0.1", self.api_port)])
+        self.pool = await self._start(self._pool_config(), [("127.0.0.1", self.api_port)])
         self.event("Пул xray перезапущен; существующие соединения прерваны", level="WARNING")
+
+    def _pool_config(self):
+        return build_config(list(self.entries.values()), self.settings, self.api_port, self.outbound_tags)
+
+    async def replace(self, proxy_id, config, port):
+        """Switch new connections without closing the SOCKS listener or other inbounds."""
+        async with self.lock:
+            if proxy_id not in self.entries or self.entries[proxy_id][2] != port:
+                raise CoreError("inbound_not_found")
+            old_tag = self.outbound_tags.get(proxy_id, f"p{proxy_id}")
+            new_tag = f"p{proxy_id}-{uuid.uuid4().hex}"
+            await self._api("ado", {"outbounds": [outbound(config, new_tag)]})
+            self.outbound_tags[proxy_id] = new_tag
+            try:
+                await self._api("adrules", {"routing": self._pool_config()["routing"]})
+            except BaseException:
+                self.outbound_tags[proxy_id] = old_tag
+                try:
+                    await self._api("adrules", {"routing": self._pool_config()["routing"]})
+                    await self._api("rmo", tag=new_tag)
+                except CoreError:
+                    await self._restart_pool()
+                raise
+            self.entries[proxy_id] = (proxy_id, config, port)
+            try:
+                await self._api("rmo", tag=old_tag)
+            except CoreError:
+                self.event("Не удалось удалить предыдущий outbound постоянного прокси", level="WARNING")
 
     async def add(self, proxy_id, config, port):
         async with self.lock:
@@ -305,7 +335,7 @@ class XrayAdapter(CoreAdapter):
             try:
                 delta = build_config([entry], self.settings)
                 await self._api("ado", {"outbounds": delta["outbounds"][1:]})
-                await self._api("adrules", {"routing": build_config(list(self.entries.values()), self.settings, self.api_port)["routing"]})
+                await self._api("adrules", {"routing": self._pool_config()["routing"]})
                 await self._api("adi", {"inbounds": delta["inbounds"]})
                 await self._wait_port(self.pool, self.settings.bind_address, port)
             except CoreError:
@@ -326,11 +356,13 @@ class XrayAdapter(CoreAdapter):
                 return
             try:
                 await self._api("rmi", tag=f"p{proxy_id}")
-                await self._api("rmo", tag=f"p{proxy_id}")
+                await self._api("rmo", tag=self.outbound_tags.get(proxy_id, f"p{proxy_id}"))
                 self.entries.pop(proxy_id, None)
-                await self._api("adrules", {"routing": build_config(list(self.entries.values()), self.settings, self.api_port)["routing"]})
+                self.outbound_tags.pop(proxy_id, None)
+                await self._api("adrules", {"routing": self._pool_config()["routing"]})
             except CoreError:
                 self.entries.pop(proxy_id, None)
+                self.outbound_tags.pop(proxy_id, None)
                 # Fail closed: an untracked inbound must never remain reachable.
                 self.event("Ошибка удаления через API; аварийное закрытие процесса для освобождения порта", proxy_id, "ERROR")
                 await self._restart_pool()
@@ -340,3 +372,4 @@ class XrayAdapter(CoreAdapter):
         for proc, _ in list(self.processes.values()):
             await self._stop(proc)
         self.entries.clear()
+        self.outbound_tags.clear()
