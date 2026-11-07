@@ -124,6 +124,40 @@ async def test_real_batch_uses_one_process_and_frees_ports(tmp_path):
         await core.close()
 
 
+async def test_scheduler_retries_good_peer_after_real_config_rejection(tmp_path, pool, monkeypatch):
+    import json
+    from conftest import seed
+    from proxyhub.checker.pipeline import Pipeline, Result
+    from proxyhub.checker.scheduler import Scheduler
+
+    seed(pool.db, 2, "new")
+    bad = parse_link('ss://unknown-cipher:password@127.0.0.1:1').asdict()
+    pool.db.execute("UPDATE proxies SET config=? WHERE id=2", (json.dumps(bad),))
+    core = XrayAdapter(Settings(xray_path=str(BIN), auto_download=False), tmp_path / "core")
+    checked = []
+
+    async def cheap(self, port):
+        assert await socks_greeting(port) == b'\x05\x00'
+        checked.append(port)
+        return Result(ok=True)
+
+    monkeypatch.setattr(Pipeline, "cheap", cheap)
+    try:
+        await core.initialize()
+        pool.core = core
+        scheduler = Scheduler(pool.db, pool, core, None)
+        rows = await scheduler.claim(2)
+        scheduler.running = len(rows)
+        await scheduler.run_batch(rows)
+        assert pool.get(1)["state"] == "valid"
+        assert pool.get(2)["reason"] == "unsupported:core_config_rejected"
+        assert len(checked) == 1
+        assert not scheduler.ports.used and scheduler.running == 0
+        assert len(core.processes) == 1  # Only the pool survives the check.
+    finally:
+        await core.close()
+
+
 async def vless_http_peer(reader, writer):
     try:
         # Minimal local VLESS peer: validate the request and return a real HTTP response.

@@ -138,3 +138,50 @@ async def test_scheduler_with_mocked_core(pool, monkeypatch):
     assert all(r["state"] == "valid" for r in pool.db.rows("SELECT state FROM proxies"))
     assert s.running == 0 and not s.ports.used
     assert len(pool.core.batches) == 1 and len(pool.core.batches[0]) == 3
+
+
+@pytest.mark.parametrize("rejected, retry_fails", [(set(), True), ({2}, False), ({2}, True), ({1, 2, 3}, False)])
+async def test_rejected_config_does_not_block_batch_peers(pool, monkeypatch, rejected, retry_fails):
+    from contextlib import asynccontextmanager
+    from proxyhub.checker.pipeline import Pipeline
+    from proxyhub.core.adapter import CoreError
+
+    seed(pool.db, 3, "new")
+    batches, checked = [], []
+
+    @asynccontextmanager
+    async def batch(entries):
+        ids = [pid for pid, _, _ in entries]
+        batches.append(ids)
+        if len(batches) == 1 or retry_fails:
+            raise CoreError("xray_process_exited")
+        yield
+
+    async def validate(config):
+        return int(config["outbounds"][1]["tag"][1:]) not in rejected
+
+    async def cheap(self, port):
+        checked.append(port)
+        return Result(ok=True, ping_ms=42)
+
+    monkeypatch.setattr(pool.core, "batch", batch)
+    monkeypatch.setattr(pool.core, "validate", validate, raising=False)
+    monkeypatch.setattr(Pipeline, "cheap", cheap)
+    scheduler = Scheduler(pool.db, pool, pool.core, None)
+    rows = await scheduler.claim(3)
+    scheduler.running = len(rows)
+    await scheduler.run_batch(rows)
+
+    retry = bool(rejected) and len(rejected) < 3
+    assert batches == [[1, 2, 3]] + ([[i for i in (1, 2, 3) if i not in rejected]] if retry else [])
+    for row in pool.db.rows("SELECT * FROM proxies"):
+        if row["id"] in rejected:
+            assert row["state"] == "unsupported"
+            assert row["reason"] == "unsupported:core_config_rejected"
+        elif retry and not retry_fails:
+            assert row["state"] == "valid" and row["reason"] is None
+        else:
+            assert row["state"] == "new" and row["reason"] == "core_batch_unavailable"
+        assert row["fails"] == 0 and row["checking"] == 0
+    assert len(checked) == (3 - len(rejected) if retry and not retry_fails else 0)
+    assert scheduler.running == 0 and not scheduler.ports.used and not scheduler.reservations

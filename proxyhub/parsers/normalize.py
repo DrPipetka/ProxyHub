@@ -23,7 +23,8 @@ class ProxyConfig:
         self.protocol = {"hy2": "hysteria2", "shadowsocks": "ss"}.get(self.protocol, self.protocol)
         self.host = self.host.strip().lower().rstrip(".")
         self.port = int(self.port)
-        if not self.host or not 1 <= self.port <= 65535 or not self.credential:
+        auth_optional = self.protocol in {"http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h"}
+        if not self.host or not 1 <= self.port <= 65535 or (not self.credential and not auth_optional):
             raise ValueError("Не указаны сервер, корректный порт или учётные данные")
         if self.protocol in ("vless", "vmess"):
             self.credential = str(uuid.UUID(self.credential))

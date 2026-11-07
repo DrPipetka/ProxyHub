@@ -51,6 +51,13 @@ class SubscriptionInterval(BaseModel):
     interval_minutes: int = Field(60, ge=0, le=525600, strict=True)
 
 
+class SubscriptionOptions(BaseModel):
+    model_config = {"extra": "forbid"}
+    interval_minutes: int = Field(60, ge=0, le=525600, strict=True)
+    delete_old_configs: bool = Field(False, strict=True)
+    keep_working_configs: bool = Field(True, strict=True)
+
+
 @public.post("/auth/login")
 async def login(body: Login, request: Request):
     service, state = request.app.state.service, request.app.state
@@ -108,12 +115,16 @@ async def add_proxies(request: Request):
                         interval = SubscriptionInterval(interval_minutes=value.get("interval_minutes", 60)).interval_minutes
                     except ValidationError:
                         raise ServiceError("invalid_subscription_interval") from None
+                    try:
+                        options = SubscriptionOptions(**{k: value[k] for k in ("delete_old_configs", "keep_working_configs") if k in value}).model_dump(exclude_unset=True)
+                    except ValidationError:
+                        raise ServiceError("invalid_subscription_options") from None
                     if "urls" in value:
-                        return await s.subscriptions.import_many(value["urls"], source, interval)
+                        return await s.subscriptions.import_many(value["urls"], source, interval, **options)
                     url = value["url"]
                     if not isinstance(url, str):
                         raise ServiceError("invalid_subscription_url")
-                    sid = s.subscriptions.save(url, source, interval)
+                    sid = s.subscriptions.save(url, source, interval, **options)
                     result = await s.subscriptions.refresh(sid)
                     return {**result, "subscription_id": sid}
                 else:
@@ -306,9 +317,15 @@ async def delete_subscriptions(request: Request, confirm: str = ""):
 
 
 @router.patch("/subscriptions/{subscription_id}")
-async def subscription_interval(subscription_id: int, body: SubscriptionInterval, request: Request):
-    request.app.state.service.subscriptions.update_interval(subscription_id, body.interval_minutes)
+async def subscription_interval(subscription_id: int, body: SubscriptionOptions, request: Request):
+    request.app.state.service.subscriptions.update_options(body.model_dump(exclude_unset=True), subscription_id)
     return {"ok": True}
+
+
+@router.patch("/subscriptions")
+async def subscription_options_all(body: SubscriptionOptions, request: Request):
+    updated = request.app.state.service.subscriptions.update_options(body.model_dump(exclude_unset=True))
+    return {"updated": updated}
 
 
 @router.post("/subscriptions/{subscription_id}/refresh")
@@ -319,10 +336,7 @@ async def refresh_subscription(subscription_id: int, request: Request):
 @router.delete("/subscriptions/{subscription_id}")
 async def delete_subscription(subscription_id: int, request: Request):
     manager = request.app.state.service.subscriptions
-    manager.get(subscription_id)
-    if subscription_id in manager.running:
-        raise ServiceError("subscription_updating", 409)
-    manager.db.execute("DELETE FROM subscriptions WHERE id=?", (subscription_id,))
+    manager.delete(subscription_id)
     return {"ok": True}
 
 

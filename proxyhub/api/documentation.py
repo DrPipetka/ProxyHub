@@ -31,8 +31,9 @@ DESCRIPTIONS = {
     ("get", "/events"): ("Журнал событий", "Последние события; before — ID для загрузки более ранних записей."),
     ("get", "/ui/events-fragment"): ("HTML журнала", "HTML-фрагмент для панели. Текст событий экранирован."),
     ("get", "/subscriptions"): ("Подписки и расписание", "items содержит URL, interval_minutes, last_attempt_at, last_success_at, next_update_at (Unix-секунды), duration_ms, last_error, last_result и updating. Интервал отсчитывается от завершения попытки, в том числе неудачной."),
-    ("patch", "/subscriptions/{subscription_id}"): ("Интервал обновления", "Интервал в минутах: 0 — только вручную, 1–525600 — автоматически. Применяется сразу, расписание сохраняется при перезапуске."),
-    ("post", "/subscriptions/{subscription_id}/refresh"): ("Обновить подписку сейчас", "Скачивает и импортирует подписку, возвращает счётчики импорта. Добавляет новые конфиги, сохраняет существующие и аренды. Одновременное обновление возвращает 409."),
+    ("patch", "/subscriptions/{subscription_id}"): ("Настройки подписки", "Поля необязательны: interval_minutes (0 — вручную, 1–525600 — автоматически), delete_old_configs, keep_working_configs. Очистка удаляет отсутствующие в свежей подписке конфиги; сохранение рабочих действует при включённой очистке. Незаданные поля не меняются."),
+    ("patch", "/subscriptions"): ("Настройки всех подписок", "Те же поля, что у отдельной подписки. Применяет переданные значения ко всем существующим подпискам одним запросом; возвращает updated. Новые подписки получают параметры при импорте. Интервал отсчитывается от сохранения, затем от завершения обновления."),
+    ("post", "/subscriptions/{subscription_id}/refresh"): ("Обновить подписку сейчас", "Скачивает и импортирует подписку, возвращает счётчики импорта. Добавляет новые конфиги; неизменившиеся сохраняют историю проверок. delete_old_configs удаляет исчезнувшие конфиги после успешного разбора без ошибок. keep_working_configs сохраняет рабочие и проверяемые. Ручные импорты, старые конфиги без связи с подпиской и конфиги других подписок защищены. removed — число удалённых, cleanup_skipped — очистка пропущена из-за ошибок разбора. Одновременное обновление возвращает 409."),
     ("delete", "/subscriptions/{subscription_id}"): ("Удалить подписку", "Удаляет URL и расписание. Уже импортированные конфиги сохраняются."),
 }
 
@@ -42,7 +43,8 @@ EXAMPLES = {
     ("post", "/proxy/{action}"): {"id": 1},
     ("post", "/actions"): {"ids": [1], "action": "recheck"},
     ("patch", "/settings"): {"pool_size": 10},
-    ("patch", "/subscriptions/{subscription_id}"): {"interval_minutes": 60},
+    ("patch", "/subscriptions/{subscription_id}"): {"interval_minutes": 5, "delete_old_configs": True, "keep_working_configs": True},
+    ("patch", "/subscriptions"): {"interval_minutes": 5, "delete_old_configs": True, "keep_working_configs": True},
 }
 
 
@@ -69,6 +71,8 @@ def build_schema(app):
                         "urls": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"type": "string"}, "example": ["https://example.com/sub1", "https://example.com/sub2"]},
                         "source": {"type": "string", "maxLength": 256},
                         "interval_minutes": {"type": "integer", "minimum": 0, "maximum": 525600, "default": 60},
+                        "delete_old_configs": {"type": "boolean", "default": False},
+                        "keep_working_configs": {"type": "boolean", "default": True},
                     }, "oneOf": [{"required": [key], "not": {"anyOf": [{"required": [other]} for other in ("data", "url", "urls") if other != key]}} for key in ("data", "url", "urls")],
                 }
                 op["requestBody"]["content"]["text/plain"] = {"schema": {"type": "string"}, "example": "trojan://PASSWORD@example.com:443"}

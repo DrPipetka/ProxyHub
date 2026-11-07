@@ -119,24 +119,22 @@ class Scheduler:
                 entries.append((row["id"], c, self.ports.take()))
             if entries:
                 try:
-                    async with self.core.batch(entries):
-                        cheap = await asyncio.gather(*(pipeline.cheap(port) for _, _, port in entries))
-                        for entry, result in zip(entries, cheap):
-                            await self.reserve_exit(entry[0], result)
-                        final = await asyncio.gather(*(pipeline.speed(e[2], r) for e, r in zip(entries, cheap)))
-                        # Only a whole-batch outage plus a failed direct probe is a test failure.
-                        for stage in ("ping", "ip", "speed"):
-                            applicable = [r for r in final if r.stage == stage]
-                            progressed = any(r.ok or (stage == "ping" and r.stage != "ping") or (stage == "ip" and r.exit_ip) or (stage == "speed" and r.speed_mbps is not None) for r in final)
-                            if applicable and not progressed and not await pipeline.test_direct(stage):
-                                for r in applicable:
-                                    r.test_error, r.reason = True, "test_url_unavailable:" + stage
-                        results.update({e[0]: r for e, r in zip(entries, final)})
+                    results.update(await self.check_entries(entries, pipeline))
                 except CoreError:
                     # Identify invalid generated configs without blaming all peers in a batch.
+                    accepted = []
                     for pid, c, port in entries:
                         valid = await self.core.validate(build_config([(pid, c, port)])) if hasattr(self.core, "validate") else True
                         results[pid] = Result(reason="core_batch_unavailable" if valid else "unsupported:core_config_rejected", test_error=valid)
+                        if valid:
+                            accepted.append((pid, c, port))
+                    # Retry the clean subset now: a long import queue would otherwise
+                    # strand these peers behind every never-checked config.
+                    if accepted and len(accepted) < len(entries):
+                        try:
+                            results.update(await self.check_entries(accepted, pipeline))
+                        except CoreError:
+                            pass  # Keep the transient errors; never retry indefinitely.
             for row in rows:
                 await self.finish(row, results.get(row["id"], Result(reason="check_interrupted", test_error=True)))
         except asyncio.CancelledError:
@@ -153,6 +151,21 @@ class Scheduler:
                 if pid in ids:
                     self.reservations.pop(ip, None)
             self.running -= len(rows)
+
+    async def check_entries(self, entries, pipeline):
+        async with self.core.batch(entries):
+            cheap = await asyncio.gather(*(pipeline.cheap(port) for _, _, port in entries))
+            for entry, result in zip(entries, cheap):
+                await self.reserve_exit(entry[0], result)
+            final = await asyncio.gather(*(pipeline.speed(e[2], r) for e, r in zip(entries, cheap)))
+            # Only a whole-batch outage plus a failed direct probe is a test failure.
+            for stage in ("ping", "ip", "speed"):
+                applicable = [r for r in final if r.stage == stage]
+                progressed = any(r.ok or (stage == "ping" and r.stage != "ping") or (stage == "ip" and r.exit_ip) or (stage == "speed" and r.speed_mbps is not None) for r in final)
+                if applicable and not progressed and not await pipeline.test_direct(stage):
+                    for r in applicable:
+                        r.test_error, r.reason = True, "test_url_unavailable:" + stage
+            return {e[0]: r for e, r in zip(entries, final)}
 
     async def run(self):
         try:

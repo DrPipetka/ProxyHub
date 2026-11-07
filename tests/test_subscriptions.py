@@ -82,6 +82,28 @@ def test_mixed_subscription_reports_bad_lines_without_storing_them(tmp_path, mon
             assert c.get('/proxies').json()['total'] == 1
 
 
+def test_clash_subscription_with_bad_yaml_entry_imports_remaining_proxies(tmp_path, monkeypatch):
+    async def download(*args):
+        return (b'proxies:\n'
+                b'  - {type: trojan, server: first.example, port: 443, password: first}\n'
+                b'  - {type: vmess, server: ::ffff:3981:3258, port: 16513, uuid: invalid}\n'
+                b'  - {type: trojan, server: last.example, port: 443, password: last}\n')
+
+    monkeypatch.setattr('proxyhub.subscriptions.download_limited', download)
+    with client_for(tmp_path) as c:
+        c.post('/auth/login', json={})
+        response = c.post('/proxies', json={'urls': ['https://example.com/clash.yaml'], 'interval_minutes': 0})
+        assert response.status_code == 200
+        result = response.json()
+        assert result['subscriptions_succeeded'] == 1 and result['subscriptions_failed'] == 0
+        assert result['received'] == 3 and result['accepted'] == 2 and result['parse_errors'] == 1
+        assert result['errors'][0]['line'] == 3
+        assert c.get('/proxies').json()['total'] == 2
+        subscription = c.get('/subscriptions').json()['items'][0]
+        assert subscription['last_error'] is None
+        assert subscription['last_result']['parse_errors'] == 1
+
+
 def test_bulk_subscription_import_partial_failure_and_duplicates(tmp_path, monkeypatch):
     calls = []
 

@@ -66,6 +66,24 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_history ON history(proxy_id, id DESC);
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, time REAL NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, proxy_id INTEGER);
         """)
+        # Existing configs have no reliable subscription ownership. Keep them
+        # independent rather than guessing from a user-supplied source label.
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(proxies)")}
+        if "independent_import" not in columns:
+            self.conn.execute("ALTER TABLE proxies ADD COLUMN independent_import INTEGER NOT NULL DEFAULT 1")
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(subscriptions)")}
+        for name, default in (("delete_old_configs", 0), ("keep_working_configs", 1)):
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE subscriptions ADD COLUMN {name} INTEGER NOT NULL DEFAULT {default}")
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS subscription_proxies (
+                subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                seen_token TEXT NOT NULL,
+                PRIMARY KEY(subscription_id, proxy_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_subscription_proxy ON subscription_proxies(proxy_id);
+        """)
 
     @contextmanager
     def transaction(self):

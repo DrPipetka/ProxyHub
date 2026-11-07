@@ -19,6 +19,28 @@ def is_html(data: str) -> bool:
                          data.lstrip("\ufeff"), re.IGNORECASE | re.DOTALL))
 
 
+def clash_flow_entries(data: str):
+    """Recover independent, single-line Clash mappings from a broken YAML list.
+
+    Only accept this unambiguous layout; do not split arbitrary YAML documents
+    or multiline mappings after a document-level parse failure.
+    """
+    lines = data.splitlines()
+    if not lines or not re.fullmatch(r"proxies:[ \t]*(?:#.*)?", lines[0]):
+        return None
+    records = []
+    indent = None
+    for n, line in enumerate(lines[1:], 2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"( *)-[ \t]+(\{.*)", line)
+        if not match or (indent is not None and len(match[1]) != indent):
+            return None
+        indent = len(match[1])
+        records.append((n, match[2]))
+    return records or None
+
+
 def entries(data: str):
     data = data.strip("\ufeff \r\n\t")
     if not data:
@@ -45,7 +67,19 @@ def entries(data: str):
             for n, item in enumerate(items, 1):
                 yield n, json.dumps(item, ensure_ascii=False), parser, item
         except (ValueError, KeyError, yaml.YAMLError):
-            yield 1, data, None, None
+            records = clash_flow_entries(data)
+            if records is None:
+                yield 1, data, None, None
+            else:
+                for n, raw in records:
+                    try:
+                        item = yaml.safe_load(raw)
+                        if not isinstance(item, dict):
+                            raise ValueError("Ожидается объект прокси")
+                    except (ValueError, yaml.YAMLError):
+                        yield n, raw, None, None
+                    else:
+                        yield n, raw, parse_clash, item
     else:
         for n, line in enumerate(io.StringIO(data), 1):
             line = line.strip()
@@ -53,7 +87,8 @@ def entries(data: str):
                 yield n, line, parse_link, line
 
 
-def import_configs(db, data, source="", protocols=None, *, persist_errors=True):
+def import_configs(db, data, source="", protocols=None, *, persist_errors=True,
+                   subscription_id=None, seen_token=None):
     protocols = protocols or {"vless", "vmess", "ss", "trojan"}
     counts = dict(received=0, accepted=0, duplicates=0, unsupported=0, parse_errors=0, errors=[])
     batch = []
@@ -63,14 +98,25 @@ def import_configs(db, data, source="", protocols=None, *, persist_errors=True):
             for record in batch:
                 n, row = record
                 try:
-                    c.execute("""INSERT INTO proxies(hash,raw,config,protocol,host,remark,source,state,reason,created_at,updated_at)
-                              VALUES(?,?,?,?,?,?,?,?,?,?,?)""", row)
+                    cursor = c.execute("""INSERT INTO proxies(hash,raw,config,protocol,host,remark,source,state,reason,created_at,updated_at,independent_import)
+                              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (*row, int(subscription_id is None)))
+                    pid = cursor.lastrowid
                     state = row[7]
                     counts[{"new": "accepted", "unsupported": "unsupported", "parse_error": "parse_errors"}[state]] += 1
                     if state != "new" and len(counts["errors"]) < 100:
                         counts["errors"].append({"line": n, "outcome": state, "reason": row[8]})
                 except sqlite3.IntegrityError:
+                    existing = c.execute("SELECT id FROM proxies WHERE hash=?", (row[0],)).fetchone()
+                    if existing is None:
+                        raise
+                    pid = existing[0]
                     counts["duplicates"] += 1
+                if subscription_id is not None:
+                    c.execute("""INSERT INTO subscription_proxies VALUES(?,?,?)
+                        ON CONFLICT(subscription_id,proxy_id) DO UPDATE SET seen_token=excluded.seen_token""",
+                              (subscription_id, pid, seen_token))
+                else:
+                    c.execute("UPDATE proxies SET independent_import=1 WHERE id=?", (pid,))
         batch.clear()
 
     for n, raw, parser, value in entries(data):
